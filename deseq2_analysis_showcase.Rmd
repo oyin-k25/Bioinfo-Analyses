@@ -1,7 +1,7 @@
 ---
 author: "Oyin K Ololade"
 date: "2025-11-20"
-output: html_document
+output: rmarkdown::github_document
 ---
 
 ```{r setup, include=FALSE}
