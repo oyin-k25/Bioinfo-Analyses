@@ -1,0 +1,434 @@
+---
+author: "Oyin K Ololade"
+date: "2025-11-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# A DESeq2 Bulk RNASeq analysis
+## Oyin K Ololade
+## 20th November 2025
+
+
+Using DESeq2 to run differential gene expression analysis on matched normal vs tumour samples from 5 patients: S02, S03, S05, S06 and S10.
+
+## Loading packages
+
+```{r message=FALSE, warning=FALSE}
+#Load packages
+
+library(DESeq2)
+library(pheatmap)
+library(tidyverse)
+library(ggrepel)
+
+
+#For Gene Set Enrichment Analysis
+library(fgsea)
+library(data.table)
+library(qusage)
+
+```
+
+
+## Load input files for DESeq2 analysis
+
+Counts data must be in WHOLE NUMBERS, i.e integers. In this case, they are.
+
+```{r}
+the_counts <- read.table("omics_data/row_count_data.nodup.txt", header = T, sep = "", row.names = 1)
+#Important to assign the gene names as the rownames of the dataframe
+
+head(the_counts) #Confirming that counts numeric values are in integer format
+```
+
+The sample metadata contains information about the patient ID and the experimental condition being assessed, i.e. normal vs tumour sample.
+```{r}
+#Loading in the sample metadata
+sample_data <- read.table("omics_data/sample_groups.txt", header = T, sep = "", row.names = 1)
+head(sample_data)
+
+```
+
+Confirming that columns in the counts matrix AND rows of the sample data are in the same order before proceeding.
+
+```{r}
+all(rownames(sample_data) %in% colnames(the_counts))
+all(rownames(sample_data) == colnames(the_counts))
+```
+## All good. Now to create a DESeqObject.
+
+
+Because normal and tumour samples were matched from the same patients, I accounted for the multi-factor design and implemented pair sample analysis when creating the DESeq object. In the following code below, the design parameter accounts for the patient ID, while keeping to differential gene expression for the "Group" condition, i.e. normal vs tumour.
+
+```{r}
+dds_Obj <- DESeqDataSetFromMatrix(countData = the_counts,
+                                  colData = sample_data,
+                                  design = ~ Patient + Group)
+dds_Obj
+
+```
+
+Applying filtering step to remove low quality reads. Retaining samples with gene counts of at least 10 or above.
+
+```{r}
+sample_groupSize <- 5 # Based on 5 samples per condition (normal vs tumour)
+keeping <- rowSums(counts(dds_Obj) >= 10) >= sample_groupSize #Total counts per gene >= 10 in 5 or more samples
+
+dds_Obj <- dds_Obj[keeping, ] #subsetting based on the above value
+
+dds_Obj
+
+
+```
+
+Gene counts filtered from 19701 to 12403.
+
+DESeq2 will default to a reference level based on alphabetical order, determining the control conditions and test condition. For good measure, to specify the control and experimental/test condition for differential gene expression, I set the factor level, with "Normal" being the control condition.
+
+```{r}
+dds_Obj$Group <- relevel(dds_Obj$Group, ref = "Normal")
+dds_Obj$Group
+```
+
+
+## Now to run the DESEq2
+
+```{r message=FALSE}
+dds_Obj <- DESeq(dds_Obj)
+dds_Obj
+```
+
+## Obtaining the results from each condition (tumour vs normal)
+
+```{r}
+results_ddsObj <- results(dds_Obj, contrast = c("Group", "Tumour", "Normal"))
+results_ddsObj
+```
+
+Positive values of log2FoldChange = upregulated genes in the "tumour" condition
+
+Negative values of log2FoldChange = downregulated genes in the "tumour" condition
+
+```{r}
+#Output of summary data
+DESeq2::summary(results_ddsObj)
+```
+
+From the LFC (log2 fold change) results in the summary output: 
+
+740 genes upregulated in tumour sample, compared to normal.
+1351 genes downregulated in tumour sample, compared to normal.
+
+
+```{r}
+#Retrieving metadata columns and its corresponding info
+mcols(results_ddsObj)$description
+
+```
+
+
+
+## Plot counts
+
+Visualising counts across the normal vs tumour group. In the below point, this outputs the most significantly expressed gene, i.e the smallest adjusted p-value, between the "tumour" and "normal" condition.
+
+```{r}
+plotCounts(dds_Obj, gene = which.min(results_ddsObj$padj), intgroup = "Group")
+```
+
+Gene SLC6A15 most differentially expressed in tumour, compared to normal tissue.
+
+## LFC shrinkage
+
+Ashr and normal methods are best suited for LFC shrinkage when contrast is involved
+```{r}
+
+results_ashr <- lfcShrink(dds_Obj, contrast = c("Group", "Tumour", "Normal"), type = "ashr")
+results_normal <- lfcShrink(dds_Obj, contrast = c("Group", "Tumour", "Normal"), type = "normal")
+
+```
+
+## MA plots
+
+**Note: specifying the plotMA from DESEq2 package as R defaults to limma's plotMA function when I ran the analysis.**
+
+I generated MA plots to determine the distribution of the log2 fold changes with the different shrinkage methods. Blue points indicate padj values less than 0.1.
+```{r}
+DESeq2::plotMA(results_ddsObj, main = "Standard MA plot")
+DESeq2::plotMA(results_ashr, main = "ashr MA plot")
+DESeq2::plotMA(results_normal, main = "Normal_LFC MA plot")
+
+```
+
+In this case, I opted to use the **ashr shrunken data** for further analyses.
+
+
+## Saving results as dataframe
+
+```{r}
+df_Ashr_res <- as.data.frame(results_ashr)
+
+#Creating new column for gene names, since they're already in SYMBOL format
+df_Ashr_res <- df_Ashr_res |> 
+  mutate(gene = rownames(df_Ashr_res), .before = 1)
+
+head(df_Ashr_res)
+```
+
+
+## Boxplot visualisation
+
+Now to explore and visualise the data. Starting with boxplots to illustrate gene expression across the samples.
+
+
+```{r}
+# First, normalise the raw counts data
+norm_counts <- counts(dds_Obj, normalized = T)
+head(norm_counts, 3)
+
+```
+
+### Normalised counts data boxplot (ggplot2 method)
+
+```{r warning=FALSE}
+df_normCounts <- as.data.frame(norm_counts)
+
+#Pivoting dataframe for generating boxplot using ggplot2
+long_normCounts <- df_normCounts |> 
+  rownames_to_column(var = "gene") |> #Setting rowname genes into a defined column 
+  pivot_longer(cols = !gene, 
+               names_to = "sample_ID", #putting all sample IDs into one column
+               values_to = "expression_count")
+#The boxplot
+long_normCounts |> 
+  ggplot(aes(x = sample_ID, y = log2(expression_count + 0.01), fill = sample_ID)) + #adding 0.01 to account for zero values
+  geom_boxplot() + labs(title = "Normalised Counts Boxplot") + theme(axis.text.x = element_text(angle = 90))
+
+```
+
+
+
+### VST data (ggplot2 method)
+
+I included the transformed data using vst method (variance stabilising transformation) to see how the boxplot would pan out.
+
+```{r}
+#Transform the data using vst method
+vst_ddsObj <- vst(dds_Obj, blind = F)
+
+#Creating data frame by extracting the transformed counts using the assay() function
+df_vstObj <- as.data.frame(assay(vst_ddsObj))
+
+#Pivoting dataframe for generating boxplot using ggplot2
+long_vstObj <- df_vstObj |> 
+  rownames_to_column(var = "gene") |> #Setting rowname genes into a defined column 
+  pivot_longer(cols = !gene, 
+               names_to = "sample_ID", #putting all sample IDs into one column
+               values_to = "expression_count")
+#The boxplot
+long_vstObj |> 
+  ggplot(aes(x = sample_ID, y = log2(expression_count), fill = sample_ID)) + 
+  geom_boxplot() + labs(title = "VST Counts Boxplot") + theme(axis.text.x = element_text(angle = 90))
+
+
+```
+
+There seems to be great variance in expression count for Patient 6's tumour sample.
+
+## Plotting PCA
+
+The following graph uses Principal Component Analysis, displaying the principal components based on the effects of the experimental conditions on gene expression. This also accounts for patient sample differences.
+```{r warning=FALSE}
+plotPCA(vst_ddsObj, intgroup = c("Group", "Patient"))
+
+```
+
+
+As with the boxplot, Patient 6's tumour sample principal component shows the highest variance for principal component 1. There is no sign of clustering with the PCs, which indicates the variation in gene expression in tumour vs normal conditions, accounting for patient differences.
+
+## Top 10 most differentially expressed genes
+
+The output of the top 10 most differentially expressed genes between tumour and normal samples. Using the padj values to subset for these genes of interest.
+
+```{r}
+
+top10_DGE <- df_Ashr_res |> arrange(padj) |> 
+  filter(padj < 0.05) |> slice_head(n = 10)
+
+top10_DGE
+
+```
+
+As seen above in the initial plotCounts graph, SLC6A15 is the most differentially expressed gene between tumour and normal samples. It has a log2 fold change over 1, suggesting that there is increased expression in tumour cells, in comparison to its normal sample variant.
+
+
+## Volcano Plot visualisation
+
+```{r}
+
+df_Ashr_res |> 
+  ggplot(aes(x = log2FoldChange, y = -log10(padj))) + 
+  geom_point() + 
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black", alpha = 0.5) + 
+  geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed", color = "black", alpha = 0.5) + 
+  geom_text_repel(data = top10_DGE, aes(label = gene), size = 3.5, 
+                  box.padding = 0.5, max.overlaps = 20) + 
+  labs(title = "Volcano Plot showing top 10 differentially expressed genes")
+
+```
+
+Let's look into what the upregulated genes are associated with, and how common they appear in cancer:
+
+- **SLC6A15:** solute carrier family 6 member 15. Interestingly, this gene is a tumour suppressor, yet it is upregulated in the tumour samples. Perhaps genetic mutations from these sample cause dysregulated function? On the other hand, overexpression of this gene has been identified in some cancers, such as brain cancers.
+
+- **PTGS2:** Prostaglandin-endoperoxide synthase 2. The encoded protein is involved in prostaglandin biosynthesis. Mutations in this gene, missense, silent, and nonsense, have been observed in various cancer indications, such as colorectal cancer.
+
+- **SPINK6:** Serine peptidase inhibitor Kazal type 6. A prognostic marker of head and neck squamous cell carcinoma. It is associated with poor prognosis in a variety of malignancies.
+
+- **TNS4:** Tensin-4. A study by Zheng et al 2025 highlights that TNS4 is a major driver of cancer progression.
+
+
+## Heatmap data visualisation
+
+From the vst data, below is a heatmap visualising the top 10 differentially expressed genes between tumour and normal samples.
+```{r}
+# A reminder
+head(df_vstObj)
+
+#Creating dataframe for column annotation. This is based on "tumour vs normal" condition
+#from the sample metadata, which is called using the colData() function
+column_ann_df <- as.data.frame(colData(dds_Obj)[,c("Group", "Patient")])
+
+#Only interested in "Group", which specifies the tumour/normal experiment conditions
+column_ann_df <- column_ann_df |> dplyr::select(Group)
+
+#Extracting a list of the top 10 gene names
+top10_list_genes <- top10_DGE$gene
+
+#Extracting vst counts data based on above list
+top10_vstObj <- assay(vst_ddsObj)[top10_list_genes, ]
+top10_vstObj
+
+#Check that rownames of matrix matches list
+all(rownames(top10_vstObj) %in% top10_list_genes)
+
+#The heatmap
+pheatmap(top10_vstObj, cluster_rows = T, cluster_cols = T, annotation_col = column_ann_df)
+
+
+
+```
+
+Focusing on SLC6A15 which is the most differentially expressed gene, it's evident that the gene is expressed at low levels in normal cells, in contrast to tumour cells.
+
+
+## Gene Set Enrichment Analysis
+
+For this next section, I conducted Pre-ranked Gene Set Enrichment Analysis to determine which gene sets are significantly expressed. I used the C5 Gene Ontology Biological Processes gene sets dataset to illustrate the biological functions that exhibit significant differences in the tumour and normal samples.
+```{r}
+gmt_file <- read.gmt("omics_data/c5.go.bp.v7.4.symbols.gmt") # Loading the C5 GO BP
+```
+
+
+Ranking the DESEq2 data based on decreasing log2FoldChange (highest to lowest).
+```{r}
+#Using the ashr shrunk results from the DESeq2 analysis
+ranked_df_Ashr_res <- df_Ashr_res[order(df_Ashr_res$log2FoldChange, decreasing = T), ]
+
+#Creating vector of log2FC with their corresponding gene name
+the_dgeRanks <- setNames(ranked_df_Ashr_res$log2FoldChange, ranked_df_Ashr_res$gene)
+
+the_dgeRanks <- the_dgeRanks[!is.na(names(the_dgeRanks))] #Removing pathways with NA values
+the_dgeRanks <- the_dgeRanks[!duplicated(names(the_dgeRanks))] #Removing duplicate pathways
+
+head(the_dgeRanks, n=10)
+
+```
+
+Running fgsea (fast gene set enrichment analysis). For minSize and maxSize parameters, these correspond to a range that I chose to explore. Testing for 15-500 gene sets.
+
+```{r warning=FALSE}
+#Using set.seed so that output of fgsea is reproducible
+set.seed(12345)
+
+#Running the pre-ranked GSEA
+fgsea_Results <- fgsea(pathways = gmt_file, stats = the_dgeRanks, minSize = 15, maxSize = 500)
+head(fgsea_Results)
+
+```
+
+### Top 10 differentially regulated BP gene sets based on padj value
+
+```{r}
+sorted_fgseaRes <- fgsea_Results |> 
+  arrange(padj) |> filter(padj < 0.05) |> slice_head(n = 10)
+
+sorted_fgseaRes
+```
+
+## GSEA Enrichment plots
+
+Here I've produced enrichment plots for the top 2 mostly upregulated BP gene sets (based on adjusted p-values) in tumour compared to normal, and the top 2 mostly downregulated BP gene sets in tumour compared to normal.
+
+Normalised Enrichment Score (NES):
+
+- Positive value = UPREGULATED PATHWAY of the test condition
+- Negative value = DOWNREGULATED PATHWAY of the test condition
+
+```{r}
+#Extracting pathways with significant enrichment value
+#Arranging by padj, then keeping only values with padj < 0.05, then extracting pathway names
+
+sig_pathways <- fgsea_Results[order(padj)]
+sig_pathways <- sig_pathways |> filter(padj < 0.05)
+
+head(sig_pathways, n = 10)
+
+```
+
+```{r}
+top2 <- sig_pathways |> arrange(desc(NES)) |> slice_head(n=2)
+top2
+
+down2 <- sig_pathways |> arrange(NES) |> slice_head(n=2)
+down2
+
+
+```
+
+```{r}
+upreg1 <- plotEnrichment(pathway = gmt_file[[top2$pathway[1]]],
+                               stats = the_dgeRanks) + labs(title = top2$pathway[1]) +
+                                                                   theme(text = element_text(size = 15))
+
+upreg2 <- plotEnrichment(pathway = gmt_file[[top2$pathway[2]]],
+                               stats = the_dgeRanks) + labs(title = top2$pathway[2]) +
+                                                                  theme(text = element_text(size = 15))
+
+#Display the enrichment plots
+upreg1
+upreg2
+
+```
+
+```{r}
+
+downreg1 <- plotEnrichment(pathway = gmt_file[[down2$pathway[1]]],
+                               stats = the_dgeRanks) + labs(title = down2$pathway[1]) +
+                                                                   theme(text = element_text(size = 15))
+
+downreg2 <- plotEnrichment(pathway = gmt_file[[down2$pathway[2]]],
+                               stats = the_dgeRanks) + labs(title = down2$pathway[2]) +
+                                                                  theme(text = element_text(size = 15))
+
+#Display the enrichment plots
+downreg1
+downreg2
+
+```
+
+
