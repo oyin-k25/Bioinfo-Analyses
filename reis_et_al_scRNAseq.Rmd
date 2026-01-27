@@ -1,0 +1,294 @@
+---
+title: "Reis et al scRNAseq Gene Expression Analysis"
+author: "Kafayat Ololade"
+date: "2026-01-07"
+output: 
+  html_document:
+    theme: flatly
+    toc: yes
+    toc_float:
+      collapsed: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Reis et al single cell RNAseq analysis: Replicating the methods using Seurat
+
+Research paper: TCR-Vγδ usage distinguishes protumor from antitumor intestinal γδ T cell subsets. Reis BS, Darcy PW et al 2022.
+
+Data is available from the GEO Accession Server under GSE205720.
+
+**Experimental setup:** *gamma delta T cells were sorted from surgically dissected tumors and adjacent nontumor areas, stimulated in vitro, and taken forward for 10X Genomics single cell RNA sequencing.*
+
+*1825 tumor-infiltrating and adjacent cells from five patients displaying at least 100 viable gd T cells per region (out of seven patients screened) (table S1 and fig. S1, A and B). Pooled analysis of 716 cells from tumors and 1109 from nontumor areas revealed 10 different clusters (Fig. 1A).*
+
+**gd TILs: **
+- Overall increased cytokine signature (gene ontology: 0005126), including IL-17–producing gd T cell–related genes, such as CD9 and LGALS3 (21) enriched in clusters 2 and 5.
+
+Non-tumour gd cells:
+- Cytotoxic-related profile, including the expression of GZMB and CXCR3, enriched in clusters 0 and 1, as well as the glycolysis-associated genes ENO1 and ALDOA (Fig. 1, B and C, and fig. S1, B and C), an overall profile resembling IFN-g–producing gd T cells)
+
+
+## Load packages
+
+```{r message=FALSE, warning=FALSE}
+library(Seurat)
+library(sctransform)
+library(cowplot)
+library(tidyverse)
+library(scRepertoire)
+
+```
+
+
+## Load files
+
+Input data from GSM6219839. 
+
+```{r}
+reis_data <- Read10X("../input/filtered_gene_bc_matrices/")
+
+seurat_obj <- CreateSeuratObject(counts = reis_data, project = "Reis et al Intestinal gd T cells 2022")
+seurat_obj
+```
+
+
+## QC and filtering
+
+Following the procedures outlined in the methods section, removing cells with >10% mitochondrial count. 
+
+```{r}
+seurat_obj[["percent.mt"]] <- PercentageFeatureSet(object = seurat_obj, pattern = "^MT-")
+
+colnames(seurat_obj@meta.data)
+head(seurat_obj@meta.data, n = 3)
+
+```
+
+### Visualising QC metrics to determine cutoffs
+
+
+```{r}
+#Violin plot
+
+VlnPlot(object = seurat_obj, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+VlnPlot(seurat_obj, features = "nFeature_RNA")
+VlnPlot(seurat_obj, features = "nCount_RNA")
+
+```
+
+Also visualising QC metrics using FeatureScatter
+
+```{r}
+FeatureScatter(seurat_obj, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+FeatureScatter(seurat_obj, feature1 = "nCount_RNA", feature2 = "percent.mt")
+```
+
+
+### Filtering the data
+
+Based on how the QC metrics appeared, I set my own filtering parameters for the number of features to include after the filtering step. 
+
+```{r}
+seurat_filt <- subset(seurat_obj,
+                      subset = percent.mt < 10 & nFeature_RNA > 100 & nFeature_RNA < 4000)
+seurat_filt
+```
+
+
+## Normalisation step using SCTransform
+
+Using the sctransform() function covers the normalizedata(), scaledata(), and FindVariableFeatures() steps in the Seurat workflow.
+
+```{r}
+seurat_filt <- SCTransform(object = seurat_filt)
+seurat_filt
+```
+The output of the SCTransform function, "SCT" active assay will be used going forward.
+
+
+## PCA dimensional reduction
+
+```{r}
+seurat_filt <- RunPCA(object = seurat_filt)
+
+```
+
+Visualising the PCs
+
+```{r}
+DimHeatmap(object = seurat_filt, dims = 1, cells = 500, balanced = T)
+
+```
+
+
+### Elbow Plot
+
+```{r}
+ElbowPlot(object =seurat_filt,
+          ndims = 50, reduction = "pca")
+
+```
+As stated in the Methods section, **30 principal components** were selected for UMAP visualisation.
+
+## UMAP and Clusterings
+
+
+```{r}
+#Find Neighbours
+seurat_filt <- FindNeighbors(seurat_filt, dims = 1:30)
+
+#Find Clusters. Resolution?
+seurat_clusters <- FindClusters(seurat_filt, resolution = 0.5)
+
+umap_obj <- RunUMAP(seurat_clusters, dims = 1:30)
+DimPlot(umap_obj, reduction = "umap", label = T)
+```
+
+
+## Identifying markers
+
+```{r}
+reis_Markers <- FindAllMarkers(object = umap_obj,
+                               min.pct = 0.25,
+                               test.use = "wilcox")
+
+head(reis_Markers, n=10)
+
+```
+
+Extracting top 10 genes per cluster based on highest log2FC. This displays genes that exhibit increased expression compared to the control.
+```{r}
+top10_markers <- reis_Markers |> 
+  group_by(cluster) |> 
+  arrange(desc(avg_log2FC)) |> 
+  slice_head(n = 10)
+
+top10_markers
+
+```
+
+
+I generated FeaturePlot highlighting abundance of specified genes in relation to the cluster. CD9 and LGALS3 was reported to be more associated with clusters 2 and 5. These genes were increased among IL-17 producing tumour infiltrating gd T cells.
+```{r}
+FeaturePlot(object = umap_obj, features = c("CD9", "LGALS3"), label = T, order = T)
+```
+
+
+```{r}
+FeaturePlot(object = umap_obj, features = c("GZMB", "CXCR3"), label = T, order = T)
+```
+
+
+### Markers of named clusters in the paper
+
+Finding markers of the clusters identified in the paper:
+
+- Clusters 0 and 1 associated with non-tumour cells
+- Clusters 2 and 5 associated with pro-tumour cells
+
+```{r}
+cluster0_markers <- FindMarkers(umap_obj, ident.1 = 0)
+cluster1_markers <- FindMarkers(umap_obj, ident.1 = 1)
+
+head(cluster0_markers, n=10)
+head(cluster1_markers, n=10)
+
+```
+
+Top 10 differentially expressed genes from cluster 0 and 1, based on padj value.
+
+```{r}
+top10_cluster0 <- cluster0_markers |> 
+  arrange(p_val_adj) |> 
+  slice_head(n=10)
+
+top10_cluster1 <- cluster1_markers |> 
+  arrange(p_val_adj) |> 
+  slice_head(n=10)
+
+top10_cluster0
+top10_cluster1
+
+```
+As mentioned in the research paper, the gene for Granzyme B (GZMB) scores highly in the top 10 most differentially expressed genes in cluster 0, confirming the presence of cytotoxic gamma delta T cells.
+
+
+
+```{r}
+cluster2_markers <- FindMarkers(umap_obj, ident.1 = 2)
+cluster5_markers <- FindMarkers(umap_obj, ident.1 = 5)
+
+head(cluster2_markers, n=10)
+head(cluster5_markers, n=10)
+
+```
+
+Top 10 differentially expressed genes from cluster 2 and 5, based on padj value.
+
+```{r}
+top10_cluster2 <- cluster2_markers |> 
+  arrange(p_val_adj) |> 
+  slice_head(n=10)
+
+top10_cluster5 <- cluster5_markers |> 
+  arrange(p_val_adj) |> 
+  slice_head(n=10)
+
+top10_cluster2
+top10_cluster5
+
+```
+
+Of interest from the top 10 DEGs in cluster 2 is CTLA4, which is known to act as a inhibitory signal to T cells. CD28, a marker of T cell proliferation and survival, features here, and its positive log2FC demonstrates that there is increased expression in tumour cell profile. 
+
+
+## Investigating genes mentioned in the paper
+
+I decided not to include ENO1 and ALDOA which were mentioned in the paper, as the colour gradient among clusters were too similar to see differences in gene expression among the clusters.
+
+```{r}
+#Creating a vector of genes specified in the paper
+
+genes_of_interest <- c("CD9", "LGALS3", "GZMB", "CXCR3")
+
+tcrs_of_interest <- c("TRGV4", "TRDV1", "TRGV8", "TRDV3", "TRGV9")
+
+
+FeaturePlot(umap_obj, features = genes_of_interest, label = T, order = T)
+FeaturePlot(umap_obj, features = tcrs_of_interest, order = T, label = T)
+
+```
+
+
+### Genes specified in the supplementary data
+
+Replicating umap plots from figures S1C
+
+```{r}
+#Creating a vector of genes specified in the supplementary data
+
+supp_genes <- c("CD8A", "IFNG", "TNF", "GZMB", "IL17A", "RORC", "MAF", "PDCD1", "IL22")
+
+FeaturePlot(umap_obj, features = supp_genes, label = T, order = T)
+
+
+```
+
+```{r}
+VlnPlot(umap_obj, features = supp_genes)
+
+```
+
+
+- PDCD1: Programmed Cell Death Protein 1 gene. Immune inhibitory receptor expressed in activated T cells, regulating CD8+ T cells.
+- RORC:RAR-related orphan receptor C gene. Encodes for the RAR-related orphan receptor gamma protein.
+
+
+
+
+
+
