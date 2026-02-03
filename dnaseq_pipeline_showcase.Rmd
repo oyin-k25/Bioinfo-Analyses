@@ -1,0 +1,209 @@
+---
+title: 'DNAseq Pipeline Showcase'
+output:
+  html_document:
+    df_print: paged
+---
+
+# Kafayat Ololade, 180600942
+
+# DNASeq Assignment Write Up: Running the Pipeline
+
+Here is a writeup of the HPC pipeline I used to aligned paired end sequencing FASTQ files. Data came from tumour and matched normal samples, and were aligned to chromosome 17.
+
+## Run Fastqc on the FastQ files
+
+Generate basic QC metrics for the FASTQ files, including sequencing quality.
+
+```{bash eval=FALSE}
+## Load the fastqc program
+module load fastqc
+## Create a folder for our QC metrics
+mkdir fastqc_output
+## run fastqc on the files, storing the output in the QC folder.
+fastqc -o fastqc_output/ raw_FastQ/*
+```
+
+From the HTML report, the overall quality of the samples are good to continue.
+
+## Alignment
+
+Using bowtie2 to align the FastQ files to chromosome 17. Samtools was used to sort the file, as the Bowtie2 output will create an unsorted SAM file.
+
+Load the modules bowtie2 and samtools software.
+
+```{bash eval=FALSE}
+module load bowtie2
+module load samtools
+```
+
+Creating directory to store alignment outputs in.
+
+```{bash eval=FALSE}
+mkdir alignment_output
+```
+
+The tumour and germline data are **paired end**, thus both R1 and R2 FASTQC files are required as input to the aligner as well as the genome index.
+
+Adding read group flags to provide information of each sample, and make it easily identifiable.
+
+-   ID (Read group ID)
+
+-   SM (Sample name)
+
+-   PL (Platform using for sequencing)
+
+-   LB (library) flags.
+
+### **Command for running alignment**
+
+I submitted a job in the HPC cluster to run in the background for the alignment due to the large resources required. I opted to use more specifications from the nodes to ensure that I got the output of the bowtie and samtools steps in good time. The resources requested for the HPC are the same for germline. To run each sample took around 30-40 minutes.
+
+```{bash eval=FALSE}
+#!/bin/bash
+#$ -pe smp 4 #Requesting 4 cores
+#$ -l h_vmem=32G #Requesting 32GB
+#$ -l h_rt=24:0:0 # Run time 24 hrs
+#$ -cwd #Run the following commands in the current working directory
+#$ -m e # Notify me by email
+#$ -M email.here@account.com # The email address to notify me on
+#$ -N 'DNAseq_Alignment_24112025' # Name of the DNAseq job I submitted
+```
+
+**Tumour**
+```{bash eval=FALSE}
+module load bowtie2
+module load samtools
+
+time bowtie2 -p 4 \
+        --rg ID:tumour \
+        --rg SM:tumour \
+        --rg PL:ILLUMINA \
+        --rg LB:tumour \
+        -x Reference/Bowtie2Idx/GRCh38.108.chr17 \
+        -1 raw_FastQ/tumour_R1.fq.gz \
+        -2 raw_FastQ/tumour_R2.fq.gz |
+        samtools sort -o alignment_output/tumour.bam -
+
+
+```
+
+**Germline**
+
+```{bash eval=FALSE}
+time bowtie2 -p 4 \
+        --rg ID:germline \
+        --rg SM:germline \
+        --rg PL:ILLUMINA \
+        --rg LB:germline \
+        -x Reference/Bowtie2Idx/GRCh38.108.chr17 \
+        -1 raw_FastQ/germline_R1.fq.gz \
+        -2 raw_FastQ/germline_R2.fq.gz |
+        samtools sort -o alignment_output/germline.bam -
+```
+
+## Looking at bam files
+
+Viewing a few of the lines from the bam files after running the alignment.
+```{bash eval=FALSE}
+samtools view -h alignment_output/tumour.bam | head -n 3
+samtools view -h alignment_output/germline.bam | head -n 3
+```
+
+## Bam alignment statistics
+
+The flagstats provide info on number of total reads, duplicates etc.
+```{bash eval=FALSE}
+samtools flagstat alignment_output/tumour.bam
+samtools flagstat alignment_output/germline.bam
+
+```
+
+## Mark Duplicates
+
+Using the MarkDuplicates tool from GATK to identify and mark duplicates in each bam file.
+
+-   Input files in SAM or BAM format (I)
+
+-   Metrics file to write duplication metrics to (M)
+
+-   Output file to write to (O)
+
+```{bash eval=FALSE}
+
+module load gatk
+## --java-options to reduce the strain of using MarkDuplicates
+## "-Xmx1G" tells Java to just use 1 GB of RAM
+## -I is the input (our aligned bam file)
+## -M is the name of a QC file that will be created in the process of marking
+## -O is the name of the output bam file with duplicate reads marked.
+gatk --java-options "-Xmx1G" MarkDuplicates \
+        -I alignment_output/tumour.bam \
+        -M fastqc_output/tumour.marked \
+        -O alignment_output/tumour.marked.bam
+        
+#For the matched normal/germline sample        
+gatk --java-options "-Xmx1G" MarkDuplicates \
+        -I alignment_output/germline.bam \
+        -M fastqc_output/germline.marked \
+        -O alignment_output/germline.marked.bam
+```
+
+Checking the alignments for marked duplicates.
+
+```{bash eval=FALSE}
+samtools flagstat alignment_output/tumour.marked.bam
+samtools flagstat alignment_output/germline.marked.bam
+```
+
+**Because the output only had ~5% duplicates (duplicates ÷ total reads), it can be inferred that the samples were NOT from amplicon sequencing, instead being sequenced via hybrid capture. Thus, the marked.bam files are taken forward for Base Quality Score Recalibration.** If the DNA sequencing was obtained from amplicon sequencing, I would use the original bam files (i.e. tumour.bam, germline.bam) instead for BQSR.
+
+## Base Quality Score Recalibration
+
+Generating the model using the BaseRecalibrator tool in gatk. This will then create recalibration file for applying the model to the bam file.
+
+-   Input BAM file (I)
+
+-   Reference sequence file (R)
+
+-   Output recalibration table file to create (O)
+
+Created directory "marked_bam_output27112025" to store results of the recalibration process etc.
+
+```{bash eval=FALSE}
+gatk --java-options "-Xmx1G" BaseRecalibrator \
+        -I alignment_output/tumour.marked.bam \
+        -R Reference/Homo_sapiens.GRCh38.108.dna.chromosome.17.fa \
+        --known-sites Reference/gatkResources/resources_broad_hg38_v0_1000G_omni2.5.hg38.noCHR.vcf \
+        -O marked_bam_output27112025/tumour.marked.table
+
+#For the matched normal/germline sample
+gatk --java-options "-Xmx1G" BaseRecalibrator \
+        -I alignment_output/germline.marked.bam \
+        -R Reference/Homo_sapiens.GRCh38.108.dna.chromosome.17.fa \
+        --known-sites Reference/gatkResources/resources_broad_hg38_v0_1000G_omni2.5.hg38.noCHR.vcf \
+        -O marked_bam_output27112025/germline.marked.table
+
+
+```
+
+Using ApplyBQSR to apply the model to the bam file for recalibration.
+
+```{bash eval=FALSE}
+gatk --java-options "-Xmx1G" ApplyBQSR \
+        -R Reference/Homo_sapiens.GRCh38.108.dna.chromosome.17.fa \
+        -I alignment_output/tumour.marked.bam \
+        --bqsr-recal-file marked_bam_output27112025/tumour.marked.table \
+        -O marked_bam_output27112025/tumour.marked.recalib.bam
+
+#For the matched normal/germline sample        
+gatk --java-options "-Xmx1G" ApplyBQSR \
+        -R Reference/Homo_sapiens.GRCh38.108.dna.chromosome.17.fa \
+        -I alignment_output/germline.marked.bam \
+        --bqsr-recal-file marked_bam_output27112025/germline.marked.table \
+        -O marked_bam_output27112025/germline.marked.recalib.bam
+
+
+```
+
+This creates a new recalibrated bam file that is now ready for variant calling.
